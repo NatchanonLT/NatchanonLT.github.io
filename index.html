@@ -376,7 +376,7 @@
   </div>
 </div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" async></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js" async></script>
 <script>
 /* ================= CARDS & EVALUATION ================= */
 const SUITS = ['s', 'h', 'd', 'c'];
@@ -974,7 +974,7 @@ function humanAct(t) {
   if (t === 'raise' && !canRaise(me())) return;
   const to = +$('#raiseRange').value;
   if (isClient()) {
-    netSend('act', { a: t, to });
+    sendSealed('act', { a: t, to });
     S.waiting = false; // the host's next state confirms the move
     updateControls();
     return;
@@ -985,7 +985,7 @@ const callOrCheck = () => humanAct(S.currentBet - me().bet > 0 ? 'call' : 'check
 
 function requestNext() {
   if (!S || !S.handOver || S.over) return;
-  if (isClient()) netSend('next', {});
+  if (isClient()) sendSealed('next', {});
   else startHand();
 }
 
@@ -1023,104 +1023,98 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 let ROOM = null; // the claude.ai lobby room, null everywhere else
 const IN_CLAUDE = !!(window.claude && window.claude.use);
 
-/* ---- PeerJS table (any website outside claude.ai) ----
-   Behaves like a claude.ai named room: every message reaches everyone at
-   the table. The host's browser relays what players send to the others. */
-const PEER_PREFIX = 'th-holdem-';
-const PEER_TIMEOUT = 9000;
-function peerTable(code, asHost) {
+/* ---- MQTT table (any website outside claude.ai) ----
+   Direct browser-to-browser connections (WebRTC) fail on many school, office
+   and mobile networks, so every message goes through public MQTT servers over
+   secure WebSockets instead. The page connects to several at once and drops
+   duplicates, so one blocked or broken server does not matter. The servers are
+   public: hole cards and moves are encrypted (see crypto below). */
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const MQTT_ROOT = 'th-holdem/v1/';
+const PEER_TIMEOUT = 10000;
+function mqttTable(code) {
   return new Promise((resolve, reject) => {
+    const me = Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
+    const topic = MQTT_ROOT + code;
     const handlers = {}, peerFns = [];
-    const conns = new Map(); // host only: player peer id -> connection
-    let hostConn = null, closed = false, settled = false, beat = null;
-    const peer = asHost ? new Peer(PEER_PREFIX + code) : new Peer();
-    const deliver = (topic, data, from) => (handlers[topic] || []).slice()
-      .forEach(fn => fn({ topic, data, peer: from, sameTab: from === peer.id }));
-    const gone = id => peerFns.forEach(fn => fn({ left: [{ peer: id }] }));
-    const drop = id => { const c = conns.get(id); if (c && conns.delete(id)) { c.close(); gone(id); } };
+    const seen = new Map();      // peer id -> last time we heard from it
+    const recent = new Set();    // message ids already delivered (one copy per server arrives)
+    let closed = false, settled = false, seq = 0;
+    const deliver = (t, data, from) => (handlers[t] || []).slice()
+      .forEach(fn => fn({ topic: t, data, peer: from, sameTab: from === me }));
+    const gone = id => { if (seen.delete(id)) peerFns.forEach(fn => fn({ left: [{ peer: id }] })); };
+
+    const clients = BROKERS.map(url => {
+      const c = mqtt.connect(url, { connectTimeout: 8000, reconnectPeriod: 3000, clean: true, keepalive: 30 });
+      c.on('connect', () => c.subscribe(topic, { qos: 0 }, err => { if (!err) ready(); }));
+      c.on('message', (_t, buf) => {
+        let m;
+        try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+        if (closed || !m || typeof m.t !== 'string' || typeof m.from !== 'string' || m.from === me) return;
+        if (recent.has(m.id)) return;
+        recent.add(m.id);
+        if (recent.size > 600) recent.delete(recent.values().next().value);
+        seen.set(m.from, Date.now());
+        if (m.t === 'ping') return;
+        if (m.t === 'bye') { gone(m.from); return; }
+        deliver(m.t, m.d, m.from);
+      });
+      c.on('error', () => {});
+      return c;
+    });
+    const send = (t, d) => {
+      const msg = JSON.stringify({ t, d, from: me, id: me + '.' + (++seq) });
+      clients.forEach(c => { if (c.connected) c.publish(topic, msg); });
+    };
 
     const api = {
-      emit(topic, data) {
+      emit(t, data) {
         if (closed) return Promise.resolve();
-        deliver(topic, data, peer.id);
-        if (asHost) conns.forEach(c => { if (c.open) c.send({ topic, data, from: peer.id }); });
-        else if (hostConn && hostConn.open) hostConn.send({ topic, data });
+        deliver(t, data, me);
+        send(t, data);
         return Promise.resolve();
       },
-      on(topic, fn) { (handlers[topic] = handlers[topic] || []).push(fn); return () => {}; },
+      on(t, fn) { (handlers[t] = handlers[t] || []).push(fn); return () => {}; },
       onPeers(fn) { peerFns.push(fn); return () => {}; },
-      peers() {
-        const others = asHost ? [...conns.keys()] : hostConn ? [hostConn.peer] : [];
-        return [{ peer: peer.id, sameTab: true }, ...others.map(p => ({ peer: p, sameTab: false }))];
+      peers() { return [{ peer: me, sameTab: true }, ...[...seen.keys()].map(p => ({ peer: p, sameTab: false }))]; },
+      leave() {
+        if (closed) return Promise.resolve();
+        send('bye');
+        closed = true;
+        clearInterval(beat);
+        setTimeout(() => clients.forEach(c => c.end(true)), 300);
+        return Promise.resolve();
       },
-      leave() { closed = true; clearInterval(beat); peer.destroy(); return Promise.resolve(); },
     };
 
-    const fail = e => { if (!settled) { settled = true; api.leave(); reject(e); } };
-    const ready = () => {
+    // Everyone pings; someone silent for 10 s has left
+    const beat = setInterval(() => {
+      if (closed) return;
+      send('ping');
+      const now = Date.now();
+      [...seen].forEach(([id, t]) => { if (now - t > PEER_TIMEOUT) gone(id); });
+    }, 3000);
+    function ready() {
       if (settled) return;
       settled = true;
-      // A closed tab does not reliably fire 'close' on WebRTC, so both sides ping
-      beat = setInterval(() => {
-        const now = Date.now();
-        if (asHost) {
-          conns.forEach((c, id) => { if (now - c.lastSeen > PEER_TIMEOUT) drop(id); else if (c.open) c.send({ topic: 'ping' }); });
-        } else if (hostConn) {
-          if (now - hostConn.lastSeen > PEER_TIMEOUT) { const id = hostConn.peer; hostConn = null; gone(id); }
-          else if (hostConn.open) hostConn.send({ topic: 'ping' });
-        }
-      }, 2000);
       resolve(api);
-    };
-    setTimeout(() => fail({ type: 'timeout' }), 12000);
-
-    peer.on('error', e => { if (!settled) fail(e); });
-    peer.on('disconnected', () => { if (!closed && !peer.destroyed) peer.reconnect(); });
-    if (asHost) {
-      peer.on('open', ready);
-      peer.on('connection', conn => {
-        conn.lastSeen = Date.now();
-        conn.on('open', () => conns.set(conn.peer, conn));
-        conn.on('data', m => {
-          conn.lastSeen = Date.now();
-          if (closed || !m || typeof m.topic !== 'string' || m.topic === 'ping') return;
-          deliver(m.topic, m.data, conn.peer);
-          conns.forEach((c, id) => { if (id !== conn.peer && c.open) c.send({ topic: m.topic, data: m.data, from: conn.peer }); });
-        });
-        conn.on('close', () => drop(conn.peer));
-      });
-    } else {
-      peer.on('open', () => {
-        const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
-        conn.lastSeen = Date.now();
-        conn.on('open', () => { hostConn = conn; ready(); });
-        conn.on('data', m => {
-          conn.lastSeen = Date.now();
-          if (closed || !m || typeof m.topic !== 'string' || m.topic === 'ping') return;
-          deliver(m.topic, m.data, m.from || conn.peer);
-        });
-        conn.on('close', () => { if (hostConn === conn) { hostConn = null; gone(conn.peer); } });
-      });
     }
+    setTimeout(() => { if (!settled) { settled = true; api.leave(); reject({ type: 'network' }); } }, 10000);
     window.addEventListener('pagehide', () => api.leave());
   });
 }
 
 // One table, whichever way this page is connected
-function openTable(code, asHost) {
+function openTable(code) {
   if (ROOM) return ROOM.join(tableName(code));
-  if (!window.Peer) return Promise.reject({ type: 'no-peerjs' });
-  return peerTable(code, asHost);
+  if (!window.mqtt) return Promise.reject({ type: 'no-lib' });
+  return mqttTable(code);
 }
-const onlineReady = () => !!ROOM || (!IN_CLAUDE && !!window.Peer);
+const onlineReady = () => !!ROOM || (!IN_CLAUDE && !!window.mqtt);
 function netErrorText(e) {
   return {
-    'no-peerjs': 'Der Online-Modus konnte nicht geladen werden. Bist du mit dem Internet verbunden?',
-    'peer-unavailable': 'Kein offener Tisch mit diesem Code gefunden.',
-    'network': 'Keine Verbindung zum Vermittlungsserver.',
-    'server-error': 'Der Vermittlungsserver ist gerade nicht erreichbar.',
-    'browser-incompatible': 'Dieser Browser unterstützt kein WebRTC.',
-    'timeout': 'Die Verbindung hat zu lange gedauert. Versuch es noch einmal.',
+    'no-lib': 'Der Online-Modus konnte nicht geladen werden. Bist du mit dem Internet verbunden?',
+    'network': 'Keine Verbindung zum Spielserver. Dein Netzwerk blockiert die Verbindung vielleicht. Versuch es mit mobilen Daten.',
   }[e && e.type] || 'Die Verbindung zum Tisch hat nicht geklappt. Versuch es gleich noch einmal.';
 }
 
@@ -1223,6 +1217,11 @@ function leave() {
 function netSend(topic, data) {
   if (NET && NET.table) NET.table.emit(topic, data).catch(() => {});
 }
+function sendSealed(topic, body) {
+  if (!NET || !NET.hostKey) return;
+  const at = S && S.log.length ? S.log[0].n : 0;
+  seal(NET.hostKey, { ...body, at }).then(box => netSend(topic, { box })).catch(() => {});
+}
 
 // Someone left the table. Wait out a short reconnect before acting on it.
 function peerLeft(peer) {
@@ -1241,7 +1240,7 @@ function peerLeft(peer) {
 /* ---- host ---- */
 async function hostTable() {
   if (NET) return;
-  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-peerjs' })); return; }
+  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-lib' })); return; }
   const name = readName();
   if (!name) return;
   lobbyErr('Tisch wird eröffnet …');
@@ -1253,7 +1252,7 @@ async function hostTable() {
       try { table = await openTable(code, true); }
       catch (e) { if (e.type !== 'unavailable-id' || tries >= 3) throw e; } // code taken: draw another
     }
-    NET ={ role: 'host', code, name, table, keys, joiners: new Map(), seatPeer: {}, started: false };
+    NET = { role: 'host', code, name, table, keys, joiners: new Map(), seatPeer: {}, started: false };
     table.on('hello', onHello);
     table.on('act', onPeerMsg);
     table.on('next', onPeerMsg);
@@ -1288,11 +1287,17 @@ function sendLobby() {
   if (ROOM) ROOM.presence({ table: { code: NET.code, host: NET.name, n: names.length, open: names.length < 4 } }).catch(() => {});
 }
 
-function onPeerMsg(m) {
+// Moves arrive sealed with the player's key, so nobody else at the table can
+// send them in that player's name. `at` is the newest log entry the player
+// had seen; an old move replayed later no longer matches and is ignored.
+async function onPeerMsg(m) {
   if (!NET || NET.role !== 'host' || m.sameTab) return;
   const seat = Object.keys(NET.seatPeer).find(k => NET.seatPeer[k] === m.peer);
-  if (seat === undefined) return;
-  const d = m.data || {};
+  const j = NET.joiners.get(m.peer);
+  if (seat === undefined || !j || !m.data || !m.data.box) return;
+  let d;
+  try { d = await unseal(j.key, m.data.box); } catch (e) { return; }
+  if (!NET || !S || (m.topic === 'act' && d.at !== S.logN)) return;
   onRemote(+seat, { t: m.topic, a: d.a, to: d.to });
 }
 
@@ -1382,7 +1387,7 @@ async function flushStates() {
 /* ---- client ---- */
 async function joinTable(codeArg) {
   if (NET) return;
-  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-peerjs' })); return; }
+  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-lib' })); return; }
   const name = readName();
   if (!name) return;
   const code = String(codeArg || $('#codeIn').value).trim().toUpperCase();
