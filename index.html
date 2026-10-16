@@ -1,3 +1,8 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Texas Hold'em</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -263,6 +268,8 @@
     *, *::before, *::after { animation: none !important; transition: none !important; }
   }
 </style>
+</head>
+<body>
 
 <div class="app">
   <header class="top">
@@ -369,6 +376,7 @@
   </div>
 </div>
 
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" async></script>
 <script>
 /* ================= CARDS & EVALUATION ================= */
 const SUITS = ['s', 'h', 'd', 'c'];
@@ -1012,7 +1020,109 @@ const tableName = code => 't-' + code.toLowerCase();
 const cleanName = s => String(s).replace(/[<>&"'`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 14);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-let ROOM = null; // the page's lobby room, null outside the published page
+let ROOM = null; // the claude.ai lobby room, null everywhere else
+const IN_CLAUDE = !!(window.claude && window.claude.use);
+
+/* ---- PeerJS table (any website outside claude.ai) ----
+   Behaves like a claude.ai named room: every message reaches everyone at
+   the table. The host's browser relays what players send to the others. */
+const PEER_PREFIX = 'th-holdem-';
+const PEER_TIMEOUT = 9000;
+function peerTable(code, asHost) {
+  return new Promise((resolve, reject) => {
+    const handlers = {}, peerFns = [];
+    const conns = new Map(); // host only: player peer id -> connection
+    let hostConn = null, closed = false, settled = false, beat = null;
+    const peer = asHost ? new Peer(PEER_PREFIX + code) : new Peer();
+    const deliver = (topic, data, from) => (handlers[topic] || []).slice()
+      .forEach(fn => fn({ topic, data, peer: from, sameTab: from === peer.id }));
+    const gone = id => peerFns.forEach(fn => fn({ left: [{ peer: id }] }));
+    const drop = id => { const c = conns.get(id); if (c && conns.delete(id)) { c.close(); gone(id); } };
+
+    const api = {
+      emit(topic, data) {
+        if (closed) return Promise.resolve();
+        deliver(topic, data, peer.id);
+        if (asHost) conns.forEach(c => { if (c.open) c.send({ topic, data, from: peer.id }); });
+        else if (hostConn && hostConn.open) hostConn.send({ topic, data });
+        return Promise.resolve();
+      },
+      on(topic, fn) { (handlers[topic] = handlers[topic] || []).push(fn); return () => {}; },
+      onPeers(fn) { peerFns.push(fn); return () => {}; },
+      peers() {
+        const others = asHost ? [...conns.keys()] : hostConn ? [hostConn.peer] : [];
+        return [{ peer: peer.id, sameTab: true }, ...others.map(p => ({ peer: p, sameTab: false }))];
+      },
+      leave() { closed = true; clearInterval(beat); peer.destroy(); return Promise.resolve(); },
+    };
+
+    const fail = e => { if (!settled) { settled = true; api.leave(); reject(e); } };
+    const ready = () => {
+      if (settled) return;
+      settled = true;
+      // A closed tab does not reliably fire 'close' on WebRTC, so both sides ping
+      beat = setInterval(() => {
+        const now = Date.now();
+        if (asHost) {
+          conns.forEach((c, id) => { if (now - c.lastSeen > PEER_TIMEOUT) drop(id); else if (c.open) c.send({ topic: 'ping' }); });
+        } else if (hostConn) {
+          if (now - hostConn.lastSeen > PEER_TIMEOUT) { const id = hostConn.peer; hostConn = null; gone(id); }
+          else if (hostConn.open) hostConn.send({ topic: 'ping' });
+        }
+      }, 2000);
+      resolve(api);
+    };
+    setTimeout(() => fail({ type: 'timeout' }), 12000);
+
+    peer.on('error', e => { if (!settled) fail(e); });
+    peer.on('disconnected', () => { if (!closed && !peer.destroyed) peer.reconnect(); });
+    if (asHost) {
+      peer.on('open', ready);
+      peer.on('connection', conn => {
+        conn.lastSeen = Date.now();
+        conn.on('open', () => conns.set(conn.peer, conn));
+        conn.on('data', m => {
+          conn.lastSeen = Date.now();
+          if (closed || !m || typeof m.topic !== 'string' || m.topic === 'ping') return;
+          deliver(m.topic, m.data, conn.peer);
+          conns.forEach((c, id) => { if (id !== conn.peer && c.open) c.send({ topic: m.topic, data: m.data, from: conn.peer }); });
+        });
+        conn.on('close', () => drop(conn.peer));
+      });
+    } else {
+      peer.on('open', () => {
+        const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
+        conn.lastSeen = Date.now();
+        conn.on('open', () => { hostConn = conn; ready(); });
+        conn.on('data', m => {
+          conn.lastSeen = Date.now();
+          if (closed || !m || typeof m.topic !== 'string' || m.topic === 'ping') return;
+          deliver(m.topic, m.data, m.from || conn.peer);
+        });
+        conn.on('close', () => { if (hostConn === conn) { hostConn = null; gone(conn.peer); } });
+      });
+    }
+    window.addEventListener('pagehide', () => api.leave());
+  });
+}
+
+// One table, whichever way this page is connected
+function openTable(code, asHost) {
+  if (ROOM) return ROOM.join(tableName(code));
+  if (!window.Peer) return Promise.reject({ type: 'no-peerjs' });
+  return peerTable(code, asHost);
+}
+const onlineReady = () => !!ROOM || (!IN_CLAUDE && !!window.Peer);
+function netErrorText(e) {
+  return {
+    'no-peerjs': 'Der Online-Modus konnte nicht geladen werden. Bist du mit dem Internet verbunden?',
+    'peer-unavailable': 'Kein offener Tisch mit diesem Code gefunden.',
+    'network': 'Keine Verbindung zum Vermittlungsserver.',
+    'server-error': 'Der Vermittlungsserver ist gerade nicht erreichbar.',
+    'browser-incompatible': 'Dieser Browser unterstützt kein WebRTC.',
+    'timeout': 'Die Verbindung hat zu lange gedauert. Versuch es noch einmal.',
+  }[e && e.type] || 'Die Verbindung zum Tisch hat nicht geklappt. Versuch es gleich noch einmal.';
+}
 
 /* ---- crypto ---- */
 const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -1055,7 +1165,9 @@ function showRoom() {
   const host = NET.role === 'host';
   $('#startBtn').hidden = !host;
   $('#roomHint').textContent = host
-    ? 'Deine Freunde öffnen diese Seite auf ihrem Gerät und wählen deinen Tisch oder geben den Code ein. Freie Plätze übernehmen Computergegner.'
+    ? (ROOM
+      ? 'Deine Freunde öffnen diese Seite auf ihrem Gerät und wählen deinen Tisch oder geben den Code ein. Freie Plätze übernehmen Computergegner.'
+      : 'Schick deinen Freunden die Einladung oder den Code. Sie öffnen diese Seite auf ihrem Gerät und treten bei. Freie Plätze übernehmen Computergegner.')
     : 'Du bist am Tisch. Warte, bis der Host das Spiel startet.';
 }
 function renderRoster(names) {
@@ -1128,15 +1240,20 @@ function peerLeft(peer) {
 
 /* ---- host ---- */
 async function hostTable() {
-  if (!ROOM) return;
+  if (NET) return;
+  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-peerjs' })); return; }
   const name = readName();
   if (!name) return;
   lobbyErr('Tisch wird eröffnet …');
   try {
-    const code = newCode();
     const keys = await makeKeys();
-    const table = await ROOM.join(tableName(code));
-    NET = { role: 'host', code, name, table, keys, joiners: new Map(), seatPeer: {}, started: false };
+    let code, table;
+    for (let tries = 0; !table; tries++) {
+      code = newCode();
+      try { table = await openTable(code, true); }
+      catch (e) { if (e.type !== 'unavailable-id' || tries >= 3) throw e; } // code taken: draw another
+    }
+    NET ={ role: 'host', code, name, table, keys, joiners: new Map(), seatPeer: {}, started: false };
     table.on('hello', onHello);
     table.on('act', onPeerMsg);
     table.on('next', onPeerMsg);
@@ -1145,7 +1262,7 @@ async function hostTable() {
     sendLobby();
   } catch (e) {
     leave();
-    lobbyErr('Der Tisch konnte nicht eröffnet werden. Versuch es gleich noch einmal.');
+    lobbyErr(netErrorText(e));
   }
 }
 
@@ -1168,7 +1285,7 @@ function sendLobby() {
   const names = [NET.name, ...[...NET.joiners.values()].map(j => j.name)];
   renderRoster(names);
   netSend('lobby', { names, key: NET.keys.pub });
-  ROOM.presence({ table: { code: NET.code, host: NET.name, n: names.length, open: names.length < 4 } }).catch(() => {});
+  if (ROOM) ROOM.presence({ table: { code: NET.code, host: NET.name, n: names.length, open: names.length < 4 } }).catch(() => {});
 }
 
 function onPeerMsg(m) {
@@ -1219,7 +1336,7 @@ function startOnline() {
   }
   fillBots(SEATS);
   netSend('start', { seats });
-  ROOM.presence({ table: null }).catch(() => {});
+  if (ROOM) ROOM.presence({ table: null }).catch(() => {});
   mySeat = 0;
   enterGame(`Online-Tisch ${NET.code} · ${seats.length + 1} Spieler`);
   newGame();
@@ -1264,7 +1381,8 @@ async function flushStates() {
 
 /* ---- client ---- */
 async function joinTable(codeArg) {
-  if (!ROOM || NET) return;
+  if (NET) return;
+  if (!onlineReady()) { lobbyErr(netErrorText({ type: 'no-peerjs' })); return; }
   const name = readName();
   if (!name) return;
   const code = String(codeArg || $('#codeIn').value).trim().toUpperCase();
@@ -1272,7 +1390,7 @@ async function joinTable(codeArg) {
   lobbyErr('Verbinde …');
   try {
     const keys = await makeKeys();
-    const table = await ROOM.join(tableName(code));
+    const table = await openTable(code, false);
     NET = { role: 'client', code, table, keys, hostPeer: null, hostKey: null, myPeer: null, started: false, log: [], queue: Promise.resolve() };
     const queued = m => { const net = NET; if (net && net.table === table) net.queue = net.queue.then(() => onHostMsg(m)).catch(() => {}); };
     ['lobby', 'reject', 'start', 'state'].forEach(t => table.on(t, queued));
@@ -1286,7 +1404,7 @@ async function joinTable(codeArg) {
     if (NET && NET.table === table && !NET.hostPeer) { leave(); lobbyErr('Kein offener Tisch mit diesem Code gefunden.'); }
   } catch (e) {
     leave();
-    lobbyErr('Die Verbindung zum Tisch hat nicht geklappt. Versuch es gleich noch einmal.');
+    lobbyErr(netErrorText(e));
   }
 }
 
@@ -1363,23 +1481,36 @@ $('#startBtn').addEventListener('click', startOnline);
 $('#leaveBtn').addEventListener('click', leave);
 $('#copyBtn').addEventListener('click', async () => {
   const btn = $('#copyBtn');
-  try { await navigator.clipboard.writeText(NET.code); btn.textContent = 'Kopiert'; }
+  // On a normal website the invite link opens the page with the code filled in
+  const text = !ROOM && location.protocol.startsWith('http')
+    ? `${location.origin}${location.pathname}?join=${NET.code}` : NET.code;
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Kopiert'; }
   catch (e) { btn.textContent = 'Code: ' + NET.code; }
-  setTimeout(() => { btn.textContent = 'Code kopieren'; }, 1600);
+  setTimeout(() => { btn.textContent = ROOM ? 'Code kopieren' : 'Einladung kopieren'; }, 1600);
 });
 
 try { $('#nameIn').value = localStorage.getItem('holdem-name') || ''; } catch (e) {}
+const joinCode = new URLSearchParams(location.search).get('join');
+if (joinCode) { $('#codeIn').value = joinCode.toUpperCase().slice(0, 5); $('#nameIn').focus(); }
 
 function setOnline(ok) {
   ['#hostBtn', '#joinBtn', '#codeIn'].forEach(s => { $(s).disabled = !ok; });
-  $('#netHint').textContent = ok ? ''
-    : 'Online spielen geht nur in der veröffentlichten Version dieser Seite. Gegen den Computer kannst du überall spielen.';
+  $('#netHint').textContent = ok ? '' : 'Der Online-Modus ist hier gerade nicht verfügbar. Gegen den Computer kannst du trotzdem spielen.';
 }
-setOnline(false);
-$('#netHint').textContent = 'Verbinde mit dem Online-Raum …';
-(async () => {
-  try { ROOM = window.claude && window.claude.use ? await window.claude.use('room') : null; } catch (e) { ROOM = null; }
-  setOnline(!!ROOM);
-  if (ROOM) ROOM.onPeers(ch => renderTables(ch.peers), () => { ROOM = null; setOnline(false); });
-})();
+if (IN_CLAUDE) {
+  // Inside claude.ai the page's live room carries the game
+  setOnline(false);
+  $('#netHint').textContent = 'Verbinde mit dem Online-Raum …';
+  (async () => {
+    try { ROOM = await window.claude.use('room'); } catch (e) { ROOM = null; }
+    setOnline(!!ROOM);
+    if (ROOM) ROOM.onPeers(ch => renderTables(ch.peers), () => { ROOM = null; setOnline(false); });
+  })();
+} else {
+  // Anywhere else PeerJS connects the players; it loads in the background
+  setOnline(true);
+  $('#copyBtn').textContent = 'Einladung kopieren';
+}
 </script>
+</body>
+</html>
